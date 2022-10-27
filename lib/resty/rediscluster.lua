@@ -31,8 +31,16 @@ local DEFAULT_READ_TIMEOUT = 1000
 
 local function parse_key(key_str)
     local left_tag_single_index = string_find(key_str, "{", 0)
-    local right_tag_single_index = string_find(key_str, "}", 0)
-    if left_tag_single_index and right_tag_single_index then
+    if not left_tag_single_index then
+        return key_str
+    end
+    local right_tag_single_index = string_find(key_str, "}", left_tag_single_index)
+    if not right_tag_single_index then
+        return key_str
+    end
+
+    if left_tag_single_index and right_tag_single_index and
+        right_tag_single_index > left_tag_single_index + 1 then
         --parse hashtag
         return key_str.sub(key_str, left_tag_single_index + 1, right_tag_single_index - 1)
     else
@@ -59,10 +67,7 @@ local cluster_invalid_cmds = {
 }
 
 local function redis_slot(str)
-    local hashtag = parse_key(str)
-    local key = (hashtag and string.len(hashtag) > 0) and
-        hashtag or str
-    return redis_crc(key)
+    return redis_crc(parse_key(str))
 end
 
 local function check_auth(self, redis_client)
