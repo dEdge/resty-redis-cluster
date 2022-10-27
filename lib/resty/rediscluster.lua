@@ -59,7 +59,10 @@ local cluster_invalid_cmds = {
 }
 
 local function redis_slot(str)
-    return redis_crc(parse_key(str))
+    local hashtag = parse_key(str)
+    local key = (hashtag and string.len(hashtag) > 0) and
+        hashtag or str
+    return redis_crc(key)
 end
 
 local function check_auth(self, redis_client)
