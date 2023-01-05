@@ -54,7 +54,6 @@ local _M = {}
 local mt = { __index = _M }
 
 local slot_cache = {}
-local master_nodes = {}
 
 local cmds_for_all_master = {
     ["flushall"] = true,
@@ -188,7 +187,7 @@ local function try_hosts_slots(self, serv_list)
                         local is_master = match(node_info[3], "master") ~= nil
                         if is_master then
                             local ip_port = split(split(node_info[2], "@")[1], ":")
-                            table_insert(master_nodes, {
+                            table_insert(self.master_nodes, {
                                 ip = ip_port[1],
                                 port = tonumber(ip_port[2])
                             })
@@ -327,7 +326,7 @@ function _M.new(_, config)
     end
 
 
-    local inst = { config = config }
+    local inst = { config = config, master_nodes = {} }
     inst = setmetatable(inst, mt)
     local _, err = inst:init_slots()
     if err then
@@ -552,7 +551,7 @@ end
 
 local function _do_cmd_master(self, cmd, key, ...)
     local errors = {}
-    for _, master in ipairs(master_nodes) do
+    for _, master in ipairs(self.master_nodes) do
         local redis_client = redis:new()
         redis_client:set_timeouts(self.config.connect_timeout or DEFAULT_CONNECTION_TIMEOUT,
                                   self.config.send_timeout or DEFAULT_SEND_TIMEOUT,
@@ -792,6 +791,148 @@ eval(script, 0, arg1, arg2 ...)
     local key = args[3] or "no_key"
     return _do_cmd(self, cmd, key, ...)
 end
+
+local function _do_cmd_master_get_reply(self, cmd, ...)
+    local errors = {}
+    local reply
+    for _, master in ipairs(self.master_nodes) do
+        local redis_client = redis:new()
+        redis_client:set_timeouts(self.config.connect_timeout or DEFAULT_CONNECTION_TIMEOUT,
+            self.config.send_timeout or DEFAULT_SEND_TIMEOUT,
+            self.config.read_timeout or DEFAULT_READ_TIMEOUT)
+        local ok, err = redis_client:connect(master.ip, master.port, self.config.connect_opts)
+        local current_reply
+        if ok then
+            current_reply, err = redis_client[cmd](redis_client, ...)
+        end
+        if err then
+            table_insert(errors, err)
+        end
+        if not reply and not err then
+            reply = current_reply
+        end
+        release_connection(redis_client, self.config)
+    end
+    return reply, #errors > 0 and table.concat(errors, ";")
+end
+
+local sha1_cache = {}
+
+---@param script string
+---@param script_md5 string
+---@return string@sha1
+local function _get_sha1_from_cache(script, script_md5)
+    local key = script_md5 or ngx.md5(script)
+    return sha1_cache[key]
+end
+
+local function _set_sha1_cache(script, script_md5, sha1)
+    local key = script_md5 or ngx.md5(script)
+    sha1_cache[key] = sha1
+end
+
+---@param self table
+---@param script string
+---@param script_md5 string|nil
+---@return string|nil@sha1
+local function _script_load(self, script, script_md5)
+    local sha1, err = _do_cmd_master_get_reply(self, "script", "load", script)
+    if err then
+        ngx.log(ngx.ERR, string.format("script load error: %s", tostring(err)))
+    end
+    if sha1 then
+        _set_sha1_cache(script, script_md5, sha1)
+        return sha1
+    else
+        return nil
+    end
+end
+
+local function _valid_string(str)
+    return type(str) == "string" and string.len(str) > 0
+end
+
+---@class DVTSRangeRequest
+---@field primary_key string
+---@field field string
+---@field time_start string|number
+---@field time_end string|number
+---@field limit number|nil
+---@field asc true|nil
+
+---@class DVTSEvalshaCommand
+---@field cmd string
+---@field range DVTSRangeRequest
+---@field sha1 string|nil
+---@field script string
+---@field script_md5 string
+---@field eval_keys string[]|nil
+---@field eval_args string[]|nil
+
+---@param eval_cmd DVTSEvalshaCommand
+local function _get_args_from_eval_cmd(eval_cmd)
+    local range = eval_cmd.range
+    local args = {eval_cmd.cmd, range.primary_key, range.field, range.time_start or "0", range.time_end or "-1"}
+    if range.limit then
+        table.insert(args, "limit")
+        table.insert(args, range.limit)
+    end
+    if range.asc then
+        table.insert(args, "desc")
+    end
+    table.insert(args, "sha1")
+    table.insert(args, eval_cmd.sha1)
+
+    local keys = eval_cmd.eval_keys or {}
+    table.insert(args, #keys)
+    for _, k in ipairs(keys) do
+        table.insert(args, k)
+    end
+
+    local eval_args = eval_cmd.eval_args or {}
+    for _, a in ipairs(eval_args) do
+        table.insert(args, a)
+    end
+    return args
+end
+
+---@param self table
+---@param eval_cmd DVTSEvalshaCommand
+function _M.dvts_evalsha(self, eval_cmd)
+    if not _valid_string(eval_cmd.script) then
+        return nil, "invalid script"
+    end
+
+    if not eval_cmd.sha1 then
+        eval_cmd.sha1 = _get_sha1_from_cache(eval_cmd.script, eval_cmd.script_md5) or
+            _script_load(self, eval_cmd.script, eval_cmd.script_md5)
+        if not eval_cmd.sha1 then
+            return nil, "failed to get script sha1"
+        end
+    end
+
+    local args = _get_args_from_eval_cmd(eval_cmd)
+    for _ = 1, 2 do
+        local resp, err = _do_cmd(self, table.unpack(args))
+
+        if err and string.find(err, "NOSCRIPT") then
+            local sha1 = _script_load(self, eval_cmd.script)
+            if sha1 then
+                eval_cmd.sha1 = sha1
+                goto retry
+            else
+                return nil, "failed to load script"
+            end
+        else
+            return resp, err
+        end
+
+        ::retry::
+    end
+
+    return nil, "max retries"
+end
+
 -- dynamic cmd
 setmetatable(_M, {
     __index = function(_, cmd)
